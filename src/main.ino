@@ -9,13 +9,11 @@
 
 // number of bytes
 #define EEPROM_SIZE 1
-
 #define PWDN_GPIO_NUM 32
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM 0
 #define SIOD_GPIO_NUM 26
 #define SIOC_GPIO_NUM 27
-
 #define Y9_GPIO_NUM 35
 #define Y8_GPIO_NUM 34
 #define Y7_GPIO_NUM 39
@@ -33,7 +31,6 @@ int pictureNum = 0;
 void setup() {
   // disable voltage regulator shit
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-
   Serial.begin(115200);
 
   // camera settings
@@ -90,8 +87,19 @@ void setup() {
     return;
   }
 
-  camera_fb_t *fb = NULL;
+  // warm-up loop to fix green tint - discard first 50 frames
+  Serial.println("Warming up camera...");
+  for (int i = 0; i < 50; i++) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Failed to capture frame during warm-up");
+      continue;
+    }
+    esp_camera_fb_return(fb);
+  }
+  Serial.println("Camera warm-up complete");
 
+  camera_fb_t *fb = NULL;
   // take a picture
   fb = esp_camera_fb_get();
   if (!fb) {
@@ -121,6 +129,8 @@ void setup() {
   }
   file.close();
 
+  esp_camera_fb_return(fb);
+
   // turn off camera flash GPIO
   pinMode(4, OUTPUT);
   digitalWrite(4, LOW);
@@ -129,6 +139,7 @@ void setup() {
   delay(1000);
   Serial.println("___________________________");
   delay(1000);
+
   esp_deep_sleep_start();
   Serial.println("If this if fukin printed means failed to enter deep sleep");
 }
