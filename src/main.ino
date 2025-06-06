@@ -27,6 +27,12 @@
 #define PCLK_GPIO_NUM 22
 
 int pictureNum = 0;
+int buttonGPIO = 12;
+int flashGPIO = 4;
+bool lastButtonState = HIGH;
+bool buttonPressed = false;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
 
 void setup() {
   // disable voltage regulator shit
@@ -70,24 +76,107 @@ void setup() {
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x", err);
-    return;
+    while (1)
+      delay(1000);
   }
   Serial.println("Camera initialized successfully");
 
-  // init sd card
-  if (!SD_MMC.begin()) {
+  // init sd card with lower frequency
+  if (!SD_MMC.begin("/sdcard", true, false, 5000)) {
     Serial.println("Card Mount Failed");
-    return;
+    while (1)
+      delay(1000);
   }
   Serial.println("SD Card initialized successfully");
 
   uint8_t cardType = SD_MMC.cardType();
   if (cardType == CARD_NONE) {
     Serial.println("No SD Card attached");
+    while (1)
+      delay(1000);
+  }
+
+  EEPROM.begin(EEPROM_SIZE);
+  pictureNum = EEPROM.read(0);
+
+  warmUpCamera(); // warm-up loop to fix green shit tint - discard first 50
+                  // frames
+
+  pinMode(flashGPIO, OUTPUT);
+  pinMode(buttonGPIO, INPUT_PULLUP); // Changed to INPUT_PULLUP
+}
+
+void loop() {
+  int reading = digitalRead(buttonGPIO);
+
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (reading != buttonPressed) {
+      buttonPressed = reading;
+
+      if (buttonPressed == LOW) {
+        Serial.println("Button pressed, taking picture...");
+        digitalWrite(flashGPIO, HIGH);
+        rtc_gpio_hold_dis(GPIO_NUM_4);
+        takePicture();
+        delay(1000);
+      }
+    }
+  }
+
+  if (buttonPressed == HIGH) {
+    digitalWrite(flashGPIO, LOW);
+    rtc_gpio_hold_en(GPIO_NUM_4);
+  }
+
+  lastButtonState = reading;
+  delay(10);
+}
+
+void takePicture() {
+  if (SD_MMC.cardType() == CARD_NONE) {
+    Serial.println("SD Card not available - stopping");
+    while (1)
+      delay(1000);
+  }
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
     return;
   }
 
-  // warm-up loop to fix green tint - discard first 50 frames
+  pictureNum++;
+  String path = "/qorwilis-dedamotynuli-suratebi" + String(pictureNum) + ".jpg";
+  Serial.printf("Picture file name: %s\n", path.c_str());
+
+  File file = SD_MMC.open(path, FILE_WRITE);
+  if (!file) {
+    Serial.println("Failed to open file for writing");
+    esp_camera_fb_return(fb);
+    return;
+  }
+
+  file.write(fb->buf, fb->len);
+  file.close();
+  esp_camera_fb_return(fb);
+
+  Serial.printf("Picture saved to %s\n", path.c_str());
+
+  // update picture number in flash memory
+  EEPROM.write(0, pictureNum);
+  EEPROM.commit();
+
+  digitalWrite(flashGPIO, LOW);
+  rtc_gpio_hold_en(GPIO_NUM_4);
+  delay(1000);
+  Serial.println("___________________________");
+}
+
+void warmUpCamera() {
   Serial.println("Warming up camera...");
   for (int i = 0; i < 50; i++) {
     camera_fb_t *fb = esp_camera_fb_get();
@@ -98,50 +187,4 @@ void setup() {
     esp_camera_fb_return(fb);
   }
   Serial.println("Camera warm-up complete");
-
-  camera_fb_t *fb = NULL;
-  // take a picture
-  fb = esp_camera_fb_get();
-  if (!fb) {
-    Serial.println("Camera capture failed");
-    return;
-  }
-
-  EEPROM.begin(EEPROM_SIZE);
-  pictureNum = EEPROM.read(0) + 1;
-
-  String path = "/qorwilis-dedamotynuli-suratebi" + String(pictureNum) + ".jpg";
-
-  // save picture to SD card
-  fs::FS &fs = SD_MMC;
-  Serial.printf("Picture file name: %s\n", path.c_str());
-
-  File file = fs.open(path.c_str(), FILE_WRITE);
-  if (!file) {
-    Serial.println("Failed to open file in writing mode");
-  } else {
-    file.write(fb->buf, fb->len);
-    Serial.printf("Saved file to path: %s\n", path.c_str());
-
-    // update picture number in flash memory
-    EEPROM.write(0, pictureNum);
-    EEPROM.commit();
-  }
-  file.close();
-
-  esp_camera_fb_return(fb);
-
-  // turn off camera flash GPIO
-  pinMode(4, OUTPUT);
-  digitalWrite(4, LOW);
-  rtc_gpio_hold_en(GPIO_NUM_4);
-
-  delay(1000);
-  Serial.println("___________________________");
-  delay(1000);
-
-  esp_deep_sleep_start();
-  Serial.println("If this if fukin printed means failed to enter deep sleep");
 }
-
-void loop() {}
