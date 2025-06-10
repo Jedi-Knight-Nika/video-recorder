@@ -1,4 +1,3 @@
-#include "Arduino.h"
 #include "FS.h"
 #include "SD_MMC.h"
 #include "driver/rtc_io.h"
@@ -7,7 +6,6 @@
 #include "soc/soc.h"
 #include <EEPROM.h>
 
-// number of bytes
 #define EEPROM_SIZE 1
 #define PWDN_GPIO_NUM 32
 #define RESET_GPIO_NUM -1
@@ -26,20 +24,23 @@
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
 
-int pictureNum = 0;
+int videoNum = 0;
 int buttonGPIO = 12;
 int flashGPIO = 4;
 bool lastButtonState = HIGH;
 bool buttonPressed = false;
+bool isRecording = false;
 unsigned long lastDebounceTime = 0;
 unsigned long debounceDelay = 50;
+unsigned long recordingStartTime = 0;
+const unsigned long maxRecordingTime = 30000;
+const int targetFPS = 10;
+const unsigned long frameInterval = 1000 / targetFPS;
 
 void setup() {
-  // disable voltage regulator shit
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
 
-  // camera settings
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -63,16 +64,15 @@ void setup() {
   config.pixel_format = PIXFORMAT_JPEG;
 
   if (psramFound()) {
-    config.frame_size = FRAMESIZE_UXGA;
-    config.jpeg_quality = 10;
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 15;
     config.fb_count = 2;
   } else {
-    config.frame_size = FRAMESIZE_SVGA;
-    config.jpeg_quality = 12;
+    config.frame_size = FRAMESIZE_QVGA; // 320x240
+    config.jpeg_quality = 20;
     config.fb_count = 1;
   }
 
-  // init camera
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x", err);
@@ -81,8 +81,7 @@ void setup() {
   }
   Serial.println("Camera initialized successfully");
 
-  // init sd card with lower frequency
-  if (!SD_MMC.begin("/sdcard", true, false, 5000)) {
+  if (!SD_MMC.begin("/sdcard", true, false, 20000)) {
     Serial.println("Card Mount Failed");
     while (1)
       delay(1000);
@@ -97,13 +96,14 @@ void setup() {
   }
 
   EEPROM.begin(EEPROM_SIZE);
-  pictureNum = EEPROM.read(0);
+  videoNum = EEPROM.read(0);
 
-  warmUpCamera(); // warm-up loop to fix green shit tint - discard first 50
-                  // frames
+  warmUpCamera();
 
   pinMode(flashGPIO, OUTPUT);
-  pinMode(buttonGPIO, INPUT_PULLUP); // Changed to INPUT_PULLUP
+  pinMode(buttonGPIO, INPUT_PULLUP);
+
+  Serial.println("Ready to record! Press button to start/stop recording.");
 }
 
 void loop() {
@@ -118,30 +118,73 @@ void loop() {
       buttonPressed = reading;
 
       if (buttonPressed == LOW) {
-        Serial.println("Button pressed, taking picture...");
-        digitalWrite(flashGPIO, HIGH);
-        rtc_gpio_hold_dis(GPIO_NUM_4);
-        takePicture();
-        delay(1000);
+        if (!isRecording) {
+          startVideoRecording();
+        } else {
+          stopVideoRecording();
+        }
       }
     }
   }
 
-  if (buttonPressed == HIGH) {
-    digitalWrite(flashGPIO, LOW);
-    rtc_gpio_hold_en(GPIO_NUM_4);
+  if (isRecording) {
+    static unsigned long lastFrameTime = 0;
+    unsigned long currentTime = millis();
+
+    if (currentTime - lastFrameTime >= frameInterval) {
+      captureVideoFrame();
+      lastFrameTime = currentTime;
+    }
+
+    if (currentTime - recordingStartTime >= maxRecordingTime) {
+      Serial.println("Max recording time reached, stopping...");
+      stopVideoRecording();
+    }
   }
 
   lastButtonState = reading;
-  delay(10);
+  delay(1);
 }
 
-void takePicture() {
+void startVideoRecording() {
   if (SD_MMC.cardType() == CARD_NONE) {
-    Serial.println("SD Card not available - stopping");
-    while (1)
-      delay(1000);
+    Serial.println("SD Card not available");
+    return;
   }
+
+  videoNum++;
+  String folderPath = "/video" + String(videoNum);
+
+  if (!SD_MMC.mkdir(folderPath)) {
+    Serial.println("Failed to create video directory");
+    return;
+  }
+
+  isRecording = true;
+  recordingStartTime = millis();
+  digitalWrite(flashGPIO, HIGH);
+
+  Serial.println("Recording started! Press button again to stop.");
+  Serial.printf("Recording to folder: %s\n", folderPath.c_str());
+}
+
+void stopVideoRecording() {
+  isRecording = false;
+  digitalWrite(flashGPIO, LOW);
+
+  EEPROM.write(0, videoNum);
+  EEPROM.commit();
+
+  Serial.println("Recording stopped!");
+  Serial.println("You can convert frames to video using ffmpeg:");
+  Serial.printf("ffmpeg -r %d -i /video%d/frame_%%04d.jpg -c:v libx264 "
+                "-pix_fmt yuv420p video%d.mp4\n",
+                targetFPS, videoNum, videoNum);
+  Serial.println("___________________________");
+}
+
+void captureVideoFrame() {
+  static int frameCount = 0;
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
@@ -149,11 +192,17 @@ void takePicture() {
     return;
   }
 
-  pictureNum++;
-  String path = "/qorwilis-dedamotynuli-suratebi" + String(pictureNum) + ".jpg";
-  Serial.printf("Picture file name: %s\n", path.c_str());
+  String folderPath = "/video" + String(videoNum);
+  String framePath = folderPath + "/frame_" + String(frameCount, 10) + ".jpg";
 
-  File file = SD_MMC.open(path, FILE_WRITE);
+  if (frameCount < 10)
+    framePath = folderPath + "/frame_000" + String(frameCount) + ".jpg";
+  else if (frameCount < 100)
+    framePath = folderPath + "/frame_00" + String(frameCount) + ".jpg";
+  else if (frameCount < 1000)
+    framePath = folderPath + "/frame_0" + String(frameCount) + ".jpg";
+
+  File file = SD_MMC.open(framePath, FILE_WRITE);
   if (!file) {
     Serial.println("Failed to open file for writing");
     esp_camera_fb_return(fb);
@@ -164,21 +213,25 @@ void takePicture() {
   file.close();
   esp_camera_fb_return(fb);
 
-  Serial.printf("Picture saved to %s\n", path.c_str());
+  frameCount++;
 
-  // update picture number in flash memory
-  EEPROM.write(0, pictureNum);
-  EEPROM.commit();
+  if (frameCount % 50 == 0) {
+    Serial.printf("Captured %d frames\n", frameCount);
+  }
 
-  digitalWrite(flashGPIO, LOW);
-  rtc_gpio_hold_en(GPIO_NUM_4);
-  delay(1000);
-  Serial.println("___________________________");
+  if (!isRecording) {
+    frameCount = 0;
+  }
+}
+
+void takePicture() {
+  if (!isRecording) {
+  }
 }
 
 void warmUpCamera() {
   Serial.println("Warming up camera...");
-  for (int i = 0; i < 50; i++) {
+  for (int i = 0; i < 30; i++) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
       Serial.println("Failed to capture frame during warm-up");
